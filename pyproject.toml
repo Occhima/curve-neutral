@@ -1,0 +1,48 @@
+[project]
+name = "curve-arbitrage-refactor"
+version = "0.6.0"
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.28",
+    "numpy>=2.0",
+    "pandas>=3.0",
+    "pandera[pandas]>=0.24",
+    "scipy>=1.14",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-cov>=6.0",
+    "pytest-mock>=3.14",
+    "ruff>=0.11",
+]
+
+[tool.pytest.ini_options]
+addopts = "-q -W error"
+pythonpath = [
+    "pricer/src",
+    "orchestration/src",
+]
+testpaths = [
+    "pricer/tests",
+    "orchestration/tests",
+]
+markers = [
+    "unit: isolated contract, function, or service-boundary test",
+    "functional: end-to-end test across real mathematical and dataframe layers",
+]
+
+[tool.coverage.run]
+source = [
+    "pricer/src",
+    "orchestration/src",
+]
+
+[tool.coverage.report]
+fail_under = 100
+show_missing = true
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
