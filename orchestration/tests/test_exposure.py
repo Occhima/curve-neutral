@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-from curve_orchestration.exposure import cashflow_matrix
+from curve_orchestration.neutralization import cashflow_matrix
 
 pytestmark = pytest.mark.unit
 

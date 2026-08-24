@@ -25,7 +25,7 @@ Only hard restrictions can make the recommended problem infeasible:
 3. **Optional hard intervals.** Bid/ask regions or deliberately exact audit
    rows can have an empty intersection with monthly bounds.
 
-The optional `build_exact_dual_anchor_plan` audit mode can additionally fail
+Exact equality rows are available through `AnchorMatrix.exact`, which can also fail
 when dependent rows have inconsistent targets, equivalently
 `rank(M) < rank([M | q])`. This exact-mode failure is not part of normal curve
 construction.

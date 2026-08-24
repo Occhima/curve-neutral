@@ -8,6 +8,7 @@ from typing import cast
 import numpy as np
 import pandas as pd
 import pandera.pandas as pa
+from numpy.typing import ArrayLike, NDArray
 from pandera.typing.pandas import DataFrame, Series
 from pricer.curves.arbitrage import (
     LinearObservations,
@@ -15,7 +16,50 @@ from pricer.curves.arbitrage import (
     solve_curve,
 )
 
-from .exposure import cashflow_matrix
+FloatArray = NDArray[np.float64]
+
+
+def cashflow_matrix(
+    delivery: ArrayLike,
+    *,
+    monthly_weight: ArrayLike = 1.0,
+    monthly_price_factor: ArrayLike = 1.0,
+    quote_price_factor: ArrayLike = 1.0,
+) -> FloatArray:
+    """Convert prepared delivery economics into a numerical exposure matrix.
+
+    This is the orchestration boundary where energy, discounting and price
+    corrections become coefficients. The Pricer receives only the resulting
+    matrix and never sees these domain concepts.
+    """
+
+    profile = np.atleast_2d(np.asarray(delivery, dtype=float))
+    month_weight = np.broadcast_to(
+        np.asarray(monthly_weight, dtype=float),
+        (profile.shape[1],),
+    )
+    month_factor = np.broadcast_to(
+        np.asarray(monthly_price_factor, dtype=float),
+        (profile.shape[1],),
+    )
+    quote_factor = np.broadcast_to(
+        np.asarray(quote_price_factor, dtype=float),
+        (profile.shape[0],),
+    )
+    denominator = (profile * month_weight).sum(axis=1) * quote_factor
+    if (
+        not np.isfinite(profile).all()
+        or not np.isfinite(month_weight).all()
+        or not np.isfinite(month_factor).all()
+        or not np.isfinite(quote_factor).all()
+        or np.any(profile < 0.0)
+        or np.any(month_weight <= 0.0)
+        or np.any(month_factor <= 0.0)
+        or np.any(quote_factor <= 0.0)
+        or np.any(denominator <= 0.0)
+    ):
+        raise ValueError("Every observation must have positive delivered weight")
+    return profile * month_weight * month_factor / denominator[:, None]
 
 
 class CurveInput(pa.DataFrameModel):
@@ -26,6 +70,10 @@ class CurveInput(pa.DataFrameModel):
     energy_weight: Series[float] = pa.Field(gt=0)
     discount_factor: Series[float] = pa.Field(gt=0)
     index_factor: Series[float] = pa.Field(gt=0)
+    index_base: Series[pa.DateTime]
+    index_start: Series[pa.DateTime]
+    ipca_base: Series[float] = pa.Field(gt=0)
+    ipca_forecast: Series[float] = pa.Field(gt=0)
     floor: Series[float]
     cap: Series[float]
     block: Series[str]
@@ -334,16 +382,29 @@ def _prepare_curve(frame: pd.DataFrame) -> DataFrame[CurveInput]:
     tenor = pd.to_datetime(frame["tenor"]).dt.to_period("M").dt.to_timestamp()
     hours = tenor.dt.days_in_month.astype(float) * 24.0
     identity = tenor.dt.strftime("%Y-%m")
+    ones = pd.Series(1.0, index=frame.index)
+    factor = frame.get("index_factor", ones).fillna(1.0)
+    base = frame.get("ipca_base", ones).fillna(1.0)
     prepared = (
-        frame.assign(tenor=tenor)
+        frame.assign(
+            tenor=tenor,
+            # ``index_factor`` is the input. The levels are carried for reporting
+            # and kept consistent, never used to recompute the factor.
+            index_factor=factor,
+            ipca_base=base,
+            ipca_forecast=factor * base,
+        )
         .assign(
             energy_weight=lambda data: data.get("energy_weight", hours).fillna(hours),
             discount_factor=lambda data: data.get(
                 "discount_factor", pd.Series(1.0, index=data.index)
             ).fillna(1.0),
-            index_factor=lambda data: data.get(
-                "index_factor", pd.Series(1.0, index=data.index)
-            ).fillna(1.0),
+            index_base=lambda data: pd.to_datetime(
+                data.get("index_base", pd.Series(tenor.min(), index=data.index))
+            ).fillna(tenor.min()),
+            index_start=lambda data: pd.to_datetime(
+                data.get("index_start", tenor)
+            ).fillna(tenor),
             floor=lambda data: data.get(
                 "floor", pd.Series(-np.inf, index=data.index)
             ).fillna(-np.inf),

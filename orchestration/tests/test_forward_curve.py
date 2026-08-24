@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import FrozenInstanceError
-
 import numpy as np
 import pandas as pd
 import pandera.errors
@@ -9,8 +7,9 @@ import pytest
 from curve_orchestration import (
     ForwardCurveOutput,
     build_dual_anchor_plan,
+    finalize_forward_curve,
     neutralize_anchor_plan,
-    neutralize_forward_curve,
+    wide_curve,
 )
 from pricer.curves.arbitrage import InfeasibleCurveError
 
@@ -23,13 +22,11 @@ def _market_problem(
     cap: float = 500.0,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     tenors = pd.date_range("2027-01-01", "2028-12-01", freq="MS")
-    market_tenors = tenors[:12]
-    factor = 1.02
     curve = pd.DataFrame(
         {
             "tenor": tenors,
             "price": np.r_[np.full(12, 295.0), np.full(12, 999.0)],
-            "index_factor": np.r_[np.full(12, factor), np.full(12, 9.0)],
+            "index_factor": np.r_[np.full(12, 1.02), np.full(12, 9.0)],
             "floor": floor,
             "cap": cap,
         }
@@ -37,27 +34,22 @@ def _market_problem(
     delivery = pd.DataFrame(
         [np.ones(12), np.r_[np.ones(3), np.zeros(9)]],
         index=["CAL27", "Q127"],
-        columns=market_tenors,
+        columns=tenors[:12],
     )
     raw = pd.DataFrame(
-        {
-            "base": [295.0, 325.0],
-            "stress": [300.0, 330.0],
-        },
+        {"base": [295.0, 325.0], "stress": [300.0, 330.0]},
         index=delivery.index,
     )
-    dcide = pd.DataFrame(
-        {
-            "tenor": tenors[12:],
-            "price": 280.0,
-            "index_factor": 1.03,
-        }
-    )
+    dcide = pd.DataFrame({"tenor": tenors[12:], "price": 280.0, "index_factor": 1.03})
     return curve, delivery, raw, dcide
 
 
-def test_market_is_neutralized_before_dcide_is_appended_and_indexed() -> None:
-    curve, delivery, raw, dcide = _market_problem(floor=280.0, cap=340.0)
+def _forward(
+    curve: pd.DataFrame,
+    delivery: pd.DataFrame,
+    raw: pd.DataFrame | pd.Series,
+    dcide: pd.DataFrame,
+) -> tuple[pd.DataFrame, object]:
     plan = build_dual_anchor_plan(
         curve,
         delivery,
@@ -65,10 +57,17 @@ def test_market_is_neutralized_before_dcide_is_appended_and_indexed() -> None:
         raw * 1.02,
         cutoff="2027-12-31",
     )
+    neutralized = neutralize_anchor_plan(plan)
+    return finalize_forward_curve(plan, neutralized, dcide), neutralized
 
-    result = neutralize_forward_curve(plan, dcide)
-    raw_curve = result.wide_raw_curve()
-    indexed_curve = result.wide_indexed_curve()
+
+def test_market_is_neutralized_before_dcide_is_appended_and_indexed() -> None:
+    curve, delivery, raw, dcide = _market_problem(floor=280.0, cap=340.0)
+
+    forward, _ = _forward(curve, delivery, raw, dcide)
+
+    raw_curve = wide_curve(forward, "raw_price")
+    indexed_curve = wide_curve(forward, "indexed_price")
     market_tenors = raw_curve.index[:12]
     hours = market_tenors.days_in_month.to_numpy(dtype=float) * 24.0
     residual = (295.0 * hours.sum() - 325.0 * hours[:3].sum()) / hours[3:].sum()
@@ -81,66 +80,36 @@ def test_market_is_neutralized_before_dcide_is_appended_and_indexed() -> None:
         raw_curve.loc[market_tenors, "base"] * 1.02,
     )
     np.testing.assert_allclose(indexed_curve.iloc[12:], 280.0 * 1.03)
-    assert result.curve.groupby("source").size().to_dict() == {
-        "dcide": 24,
-        "market": 24,
-    }
-    ForwardCurveOutput.validate(result.curve, lazy=True)
+    assert forward.groupby("origin").size().to_dict() == {"dcide": 24, "market": 24}
+    ForwardCurveOutput.validate(forward, lazy=True)
 
 
 def test_complete_forward_pipeline_is_idempotent() -> None:
     curve, delivery, raw, dcide = _market_problem()
-    first_plan = build_dual_anchor_plan(
-        curve,
-        delivery,
-        raw,
-        raw * 1.02,
-        cutoff="2027-12-31",
-    )
-    first = neutralize_forward_curve(first_plan, dcide)
+
+    first, _ = _forward(curve, delivery, raw, dcide)
     rebalanced = curve.assign(
-        price=np.r_[first.wide_raw_curve()["base"].iloc[:12], np.full(12, 999.0)]
+        price=np.r_[
+            wide_curve(first, "raw_price")["base"].iloc[:12], np.full(12, 999.0)
+        ]
     )
+    second, _ = _forward(rebalanced, delivery, raw, dcide)
 
-    second = neutralize_forward_curve(
-        build_dual_anchor_plan(
-            rebalanced,
-            delivery,
-            raw,
-            raw * 1.02,
-            cutoff="2027-12-31",
-        ),
-        dcide,
-    )
-
-    pd.testing.assert_frame_equal(second.curve, first.curve)
+    pd.testing.assert_frame_equal(second, first)
 
 
-@pytest.mark.parametrize(
-    ("floor", "cap"),
-    [
-        (0.0, 320.0),
-        (290.0, 500.0),
-    ],
-)
+@pytest.mark.parametrize(("floor", "cap"), [(0.0, 320.0), (290.0, 500.0)])
 def test_market_bounds_limit_the_soft_solution_instead_of_making_quotes_infeasible(
     floor: float,
     cap: float,
 ) -> None:
     curve, delivery, raw, dcide = _market_problem(floor=floor, cap=cap)
-    plan = build_dual_anchor_plan(
-        curve,
-        delivery,
-        raw["base"],
-        raw["base"] * 1.02,
-        cutoff="2027-12-31",
-    )
 
-    result = neutralize_forward_curve(plan, dcide)
-    market = result.curve.query("source == 'market'")
+    forward, neutralized = _forward(curve, delivery, raw["base"], dcide)
 
+    market = forward.query("origin == 'market'")
     assert market["raw_price"].between(floor, cap).all()
-    assert result.neutralization.anchors["residual"].abs().max() > 0.0
+    assert neutralized.anchors["residual"].abs().max() > 0.0
 
 
 def test_shared_block_can_make_monthly_bounds_themselves_infeasible() -> None:
@@ -162,26 +131,16 @@ def test_shared_block_can_make_monthly_bounds_themselves_infeasible() -> None:
     )
 
     with pytest.raises(InfeasibleCurveError):
-        neutralize_anchor_plan(plan, prior_strength=0.0)
+        neutralize_anchor_plan(plan)
 
 
-def test_forward_result_is_frozen_and_exposes_wide_views() -> None:
+def test_wide_views_expose_one_column_per_scenario() -> None:
     curve, delivery, raw, dcide = _market_problem()
-    result = neutralize_forward_curve(
-        build_dual_anchor_plan(
-            curve,
-            delivery,
-            raw["base"],
-            raw["base"] * 1.02,
-            cutoff="2027-12-31",
-        ),
-        dcide,
-    )
 
-    assert result.wide_raw_curve().shape == (24, 1)
-    assert result.wide_indexed_curve().shape == (24, 1)
-    with pytest.raises(FrozenInstanceError):
-        result.curve = result.curve.iloc[:1]  # type: ignore[misc]
+    forward, _ = _forward(curve, delivery, raw, dcide)
+
+    assert wide_curve(forward, "raw_price").shape == (24, 2)
+    assert wide_curve(forward, "indexed_price").columns.tolist() == ["base", "stress"]
 
 
 def test_forward_output_contract_rejects_duplicate_scenario_tenors() -> None:
@@ -189,7 +148,7 @@ def test_forward_output_contract_rejects_duplicate_scenario_tenors() -> None:
         {
             "tenor": ["2027-01-01", "2027-01-01"],
             "scenario": ["base", "base"],
-            "source": ["market", "market"],
+            "origin": ["market", "market"],
             "raw_price": [100.0, 100.0],
             "index_factor": [1.0, 1.0],
             "indexed_price": [100.0, 100.0],

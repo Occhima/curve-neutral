@@ -21,15 +21,16 @@ def test_client_reads_the_documented_market_data_routes(
     deals_response.headers = {}
     http.get.side_effect = [tickers_response, deals_response]
 
-    snapshot = EhubClient(http).snapshot(
-        9,
+    client = EhubClient(http)
+    tickers = client.list_negotiable_tickers(9)
+    deals = client.list_all_deals(
         date(2026, 8, 1),
         date(2026, 8, 22),
         origin_operation_type="Match",
     )
 
-    assert snapshot.negotiable_tickers == ({"id": 41},)
-    assert snapshot.deals == ({"id": 73},)
+    assert tickers == ({"id": 41},)
+    assert deals == ({"id": 73},)
     assert http.get.call_args_list == [
         mocker.call(
             "/bus/v1/negotiable-tickers",
