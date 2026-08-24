@@ -464,11 +464,18 @@ def build_market_plan(
     profiles = delivery_profiles(quotes, anchor_ids, tenors)
     marks = quotes.drop_duplicates("product_id").set_index("product_id")
     raw = marks["price"].reindex(anchor_ids).rename("base")
-    indexed = raw.mul(
+    # Read the factor off the indexed curve, not the input one: with ``ipca``
+    # supplied the input carries no factor, which would silently make every
+    # indexed anchor equal its raw anchor and collapse the dual system.
+    quote_factor = (
         marks["start"]
         .reindex(anchor_ids)
-        .map(prepared.set_index("tenor")["index_factor"])
+        .map(unbalanced.set_index("tenor")["index_factor"])
     )
+    if quote_factor.isna().any():
+        missing = sorted(anchor_ids[quote_factor.isna()])
+        raise KeyError(f"Anchors start outside the priced curve: {missing}")
+    indexed = raw.mul(quote_factor)
     if quality is None:
         quality = (
             marks["precision"].reindex(anchor_ids) if "precision" in marks else 1.0
