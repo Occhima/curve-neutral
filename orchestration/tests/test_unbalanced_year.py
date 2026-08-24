@@ -6,7 +6,9 @@ import numpy as np
 import pandas as pd
 import pytest
 from curve_orchestration import (
+    build_dual_anchor_plan,
     build_market_plan,
+    curve_standard_error,
     neutralize_anchor_plan,
     normalize_products,
 )
@@ -177,6 +179,67 @@ def test_surface_weights_bracket_the_two_single_surface_answers(
     assert (
         indexed_heavy["2027-04-01"] < balanced["2027-04-01"] < raw_heavy["2027-04-01"]
     )
+
+
+def test_the_illiquid_stub_carries_more_error_than_the_traded_quarter(
+    curve: pd.DataFrame,
+    quotes: pd.DataFrame,
+    ipca: pd.DataFrame,
+) -> None:
+    """The residual inherits the annual anchor's error, amplified by 1/(1-s)."""
+
+    priced = quotes.assign(
+        precision=quotes["product_id"].map({"Q127": 25.0}).fillna(1.0)
+    )
+    plan = build_market_plan(
+        curve, priced, cutoff="2028-12-31", ipca=ipca, base_date=BASE_DATE
+    )
+
+    error = curve_standard_error(plan).set_index("tenor")
+
+    q1_std = error.loc["2027-01-01", "price_std"]
+    residual_std = error.loc["2027-06-01", "price_std"]
+    assert residual_std > q1_std
+    # 3 of 12 months already priced, so the stub absorbs roughly 1/(1-s)
+    share = HOURS[:3].sum() / HOURS.sum()
+    assert residual_std / error.loc["2028-06-01", "price_std"] == pytest.approx(
+        1.0 / (1.0 - share), rel=0.35
+    )
+    assert error.loc["2027-06-01", "leverage"] > 1.0
+
+
+def test_the_band_widens_as_the_anchors_get_noisier(
+    curve: pd.DataFrame,
+    quotes: pd.DataFrame,
+    ipca: pd.DataFrame,
+) -> None:
+    """Quartering every precision must double every standard error."""
+
+    def band(scale: float) -> pd.Series:
+        plan = build_market_plan(
+            curve,
+            quotes.assign(precision=scale),
+            cutoff="2028-12-31",
+            ipca=ipca,
+            base_date=BASE_DATE,
+        )
+        return curve_standard_error(plan).set_index("tenor")["price_std"]
+
+    np.testing.assert_allclose(band(0.25), band(1.0) * 2.0, rtol=1e-9)
+
+
+def test_a_two_year_contract_cannot_identify_both_calendar_years() -> None:
+    """Years are always separate blocks, so one anchor leaves a free direction."""
+
+    tenors = pd.date_range("2027-01-01", "2028-12-01", freq="MS")
+    flat = pd.DataFrame({"tenor": tenors, "price": 300.0})
+    delivery = pd.DataFrame([np.ones(len(tenors))], index=["CAL2Y"], columns=tenors)
+    prices = pd.Series([295.0], index=delivery.index, name="base")
+
+    plan = build_dual_anchor_plan(flat, delivery, prices, prices)
+
+    with pytest.raises(ValueError, match="do not identify every block"):
+        neutralize_anchor_plan(plan)
 
 
 def test_an_anchor_starting_before_the_curve_is_rejected(

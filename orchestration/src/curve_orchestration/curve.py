@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 import pandera.pandas as pa
 from pandera.typing.pandas import DataFrame, Series
+from pricer.curves.arbitrage import block_basis
 
 from .neutralization import (
     AnchorMatrix,
@@ -634,6 +635,88 @@ def build_dual_anchor_plan(
     )
 
 
+class CurveErrorOutput(pa.DataFrameModel):
+    """Per-month standard error implied by the anchor precisions."""
+
+    tenor: Series[pa.DateTime] = pa.Field(unique=True)
+    price_std: Series[float] = pa.Field(ge=0)
+    leverage: Series[float] = pa.Field(ge=0)
+
+    class Config:
+        coerce = True
+        strict = True
+
+
+def _information(plan: AnchorPlan) -> tuple[np.ndarray, np.ndarray, pd.DatetimeIndex]:
+    """Return the basis, the Fisher information over latent blocks, and its tenors.
+
+    ``information = (A B)' W (A B)`` is what the weighted least squares actually
+    inverts. Singular means the anchors do not identify every block: with no
+    prior the solver would then return an arbitrary feasible point.
+    """
+
+    active = plan.active_tenors
+    scoped = plan.curve.query("tenor in @active", local_dict={"active": active})
+    basis, names = block_basis(
+        scoped["block"].to_numpy(),
+        shape=scoped["seasonal_shape"].to_numpy(),
+        economic_weight=(
+            scoped["energy_weight"] * scoped["discount_factor"] * scoped["index_factor"]
+        ).to_numpy(),
+    )
+    economic = plan.anchors.exposure.reindex(columns=active).to_numpy(dtype=float)
+    weight = plan.anchors.weight
+    precision = (
+        weight.reindex(plan.anchors.exposure.index).to_numpy(dtype=float)
+        if isinstance(weight, pd.Series)
+        else np.full(len(economic), 1.0 if weight is None else float(weight))
+    )
+    reduced = economic @ basis
+    information = reduced.T @ (precision[:, None] * reduced)
+    if np.linalg.matrix_rank(information) < information.shape[0]:
+        raise ValueError(
+            f"Anchors do not identify every block: {sorted(map(str, names))}"
+        )
+    return basis, information, pd.DatetimeIndex(scoped["tenor"])
+
+
+@pa.check_types(lazy=True)
+def curve_standard_error(plan: AnchorPlan) -> DataFrame[CurveErrorOutput]:
+    """Propagate anchor precision into a per-month error on the solved curve.
+
+    ``cov(x) = information**-1`` and ``cov(p) = B cov(x) B'``. Calibrated only
+    when ``weight`` is a true inverse variance, which ``estimate_anchor_prices``
+    supplies as ``precision``; otherwise the numbers are relative. It also
+    assumes no monthly bound binds, since an active bound truncates the
+    distribution.
+
+    ``leverage`` is the month's error divided by the smallest anchor error, the
+    amplification a thin market pays: an illiquid stub left after liquid
+    products have priced a share ``s`` of the year inherits the annual anchor's
+    error scaled by roughly ``1 / (1 - s)``.
+    """
+
+    basis, information, tenors = _information(plan)
+    covariance = basis @ np.linalg.inv(information) @ basis.T
+    price_std = np.sqrt(np.clip(np.diag(covariance), 0.0, None))
+    weight = plan.anchors.weight
+    anchor_std = (
+        1.0 / np.sqrt(weight.to_numpy(dtype=float).max())
+        if isinstance(weight, pd.Series)
+        else 1.0
+    )
+    return cast(
+        DataFrame[CurveErrorOutput],
+        pd.DataFrame(
+            {
+                "tenor": tenors,
+                "price_std": price_std,
+                "leverage": price_std / anchor_std,
+            }
+        ),
+    )
+
+
 def neutralize_anchor_plan(
     plan: AnchorPlan,
     *,
@@ -641,8 +724,15 @@ def neutralize_anchor_plan(
     smoothness: float = 0.0,
     tolerance: float = 1e-9,
 ) -> NeutralizationResult:
-    """Neutralize only the plan's delivery scope and preserve every other month."""
+    """Neutralize only the plan's delivery scope and preserve every other month.
 
+    With ``prior_strength == 0`` the anchors alone must identify every block, so
+    that is checked up front: otherwise the solve would silently return one
+    arbitrary point out of a whole feasible subspace.
+    """
+
+    if prior_strength == 0.0 and smoothness == 0.0:
+        _information(plan)
     active = plan.active_tenors
     scoped = neutralize_curve(
         cast(

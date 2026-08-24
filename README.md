@@ -101,6 +101,20 @@ Inconsistent marks do not raise: they produce the minimum weighted residual.
 Only hard restrictions (block/bound conflicts, empty bound intersections) can
 make the problem infeasible — see `infeasibility.md`.
 
+With no prior the anchors alone must identify every block, so
+`neutralize_anchor_plan` checks the rank of `(A B)' W (A B)` first: otherwise it
+would silently return one arbitrary point out of a whole feasible subspace. A
+24-month contract, for instance, cannot price two calendar years on its own,
+because years are always separate blocks.
+
+`curve_standard_error(plan)` inverts that same information matrix to give a
+per-month standard error. It is what a thin market needs: an illiquid stub left
+after liquid products have priced a share `s` of the year inherits the annual
+anchor's error amplified by about `1 / (1 - s)`, so 11 liquid months turn a
+±1 quote error into ±12 on the orphan month. The curve itself stays one scalar
+per tenor; this is a diagnostic beside it, calibrated only when the weights are
+true inverse variances (which `precision` supplies) and no monthly bound binds.
+
 **5. Compose.** Now, and only now, DCIDE and indexation.
 
 ```python
